@@ -1,0 +1,112 @@
+use reqwest::Client;
+use serde_json::{json, Value};
+use std::{env, time::Duration};
+use tokio::time::sleep;
+
+#[derive(Clone)]
+struct Slot {
+    agent: &'static str,
+    label: &'static str,
+    provider: &'static str, // "openrouter" | "groq"
+    model: &'static str,
+}
+
+fn jimmy_slots() -> Vec<Slot> {
+    vec![
+        Slot{agent:"JIMMY",label:"J1-Hermes405B",   provider:"openrouter", model:"nousresearch/hermes-3-llama-3.1-405b"},
+        Slot{agent:"JIMMY",label:"J2-Qwen3Coder480B",provider:"openrouter", model:"qwen/qwen3-coder"},
+        Slot{agent:"JIMMY",label:"J3-Qwen3-32B",    provider:"groq",       model:"qwen/qwen3-32b"},
+        Slot{agent:"JIMMY",label:"J4-Llama3.3-70B", provider:"groq",       model:"llama-3.3-70b-versatile"},
+    ]
+}
+
+fn sherlock_slots() -> Vec<Slot> {
+    vec![
+        Slot{agent:"SHERLOCK",label:"S1-DeepSeekR1",   provider:"openrouter", model:"deepseek/deepseek-r1-distill-llama-70b"},
+        Slot{agent:"SHERLOCK",label:"S2-GPT-OSS-120B", provider:"openrouter", model:"openai/gpt-oss-120b"},
+        Slot{agent:"SHERLOCK",label:"S3-Llama3.3-70B", provider:"openrouter", model:"meta-llama/llama-3.3-70b-instruct"},
+    ]
+}
+
+async fn call_openrouter(client: &Client, key: &str, model: &str, prompt: &str) -> Result<String, String> {
+    let res = client.post("https://openrouter.ai/api/v1/chat/completions")
+        .bearer_auth(key)
+        .header("HTTP-Referer", "https://aiaxonetis.hostflowai.net")
+        .header("X-Title", "AXONETIS AI Builder")
+        .json(&json!({
+            "model": model,
+            "messages": [{"role":"user","content": prompt}],
+            "max_tokens": 400
+        }))
+        .send().await.map_err(|e| e.to_string())?;
+    let status = res.status();
+    let v: Value = res.json().await.map_err(|e| e.to_string())?;
+    if !status.is_success() { return Err(format!("HTTP {} {}", status, v)); }
+    Ok(v["choices"][0]["message"]["content"].as_str().unwrap_or("(empty)").to_string())
+}
+
+async fn call_groq(client: &Client, key: &str, model: &str, prompt: &str) -> Result<String, String> {
+    let res = client.post("https://api.groq.com/openai/v1/chat/completions")
+        .bearer_auth(key)
+        .json(&json!({
+            "model": model,
+            "messages": [{"role":"user","content": prompt}],
+            "max_tokens": 400
+        }))
+        .send().await.map_err(|e| e.to_string())?;
+    let status = res.status();
+    let v: Value = res.json().await.map_err(|e| e.to_string())?;
+    if !status.is_success() { return Err(format!("HTTP {} {}", status, v)); }
+    Ok(v["choices"][0]["message"]["content"].as_str().unwrap_or("(empty)").to_string())
+}
+
+async fn fire_slot(client: Client, or_key: String, groq_key: String, slot: Slot, prompt: String) -> (Slot, Result<String,String>) {
+    let out = if slot.provider == "openrouter" {
+        call_openrouter(&client, &or_key, slot.model, &prompt).await
+    } else {
+        call_groq(&client, &groq_key, slot.model, &prompt).await
+    };
+    (slot, out)
+}
+
+async fn run_ensemble(client: &Client, or_key: &str, groq_key: &str, slots: Vec<Slot>, prompt: &str) {
+    let agent = slots[0].agent;
+    println!("\n========== [{}] ENSEMBLE FIRE — {} models parallel ==========", agent, slots.len());
+    let mut handles = vec![];
+    for s in slots {
+        let c = client.clone();
+        let ok = or_key.to_string();
+        let gk = groq_key.to_string();
+        let p = prompt.to_string();
+        handles.push(tokio::spawn(fire_slot(c, ok, gk, s, p)));
+    }
+    for h in handles {
+        match h.await {
+            Ok((slot, Ok(text))) => {
+                println!("\n--- [{} | {}] OK ---\n{}\n", slot.agent, slot.label, text.chars().take(800).collect::<String>());
+            }
+            Ok((slot, Err(e))) => {
+                println!("\n--- [{} | {}] ERROR: {} ---", slot.agent, slot.label, e);
+            }
+            Err(e) => println!("\n--- join error: {} ---", e),
+        }
+    }
+    println!("========== [{}] ENSEMBLE CYCLE DONE ==========\n", agent);
+}
+
+#[tokio::main]
+async fn main() {
+    let or_key   = env::var("OPENROUTER_API_KEY").expect("OPENROUTER_API_KEY missing");
+    let groq_key = env::var("GROQ_API_KEY").expect("GROQ_API_KEY missing");
+    let client = Client::builder().timeout(Duration::from_secs(90)).build().unwrap();
+
+    let jimmy_prompt = "You are Jimmy, the AXONETIS Builder beast. Observe the current builder UI state and suggest the next concrete build action in 3 lines.";
+    let sherlock_prompt = "You are Sherlock, the AXONETIS auditor. Audit the last build cycle for risks, security, and correctness in 3 lines.";
+
+    loop {
+        run_ensemble(&client, &or_key, &groq_key, jimmy_slots(), jimmy_prompt).await;
+        run_ensemble(&client, &or_key, &groq_key, sherlock_slots(), sherlock_prompt).await;
+        println!("[CYCLE] Sleeping 15s before next ensemble burst...\n");
+        sleep(Duration::from_secs(15)).await;
+    }
+}
